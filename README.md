@@ -1,10 +1,12 @@
+<img src="docs/banner.svg" alt="tessera — multi-tenant, partitioned, Raft-replicated KV store" width="100%" />
+
 # Tessera
 
-**A multi-tenant, partitioned, Raft-replicated key-value store — and the deterministic simulator that tries to break it.**
+**A multi-tenant, partitioned, Raft-replicated key-value store — and the deterministic simulator built to break it.**
 
-Tessera is a small but complete model of how a production multi-tenant database is put together: data is cut into key-range partitions, every partition is a 3-way Raft group, partitions that run hot split themselves at the point of maximum load, every tenant is rate-limited at two levels, and request routers are shuffle-sharded so one bad tenant cannot take everyone down.
+Tessera is what you'd get if you sat down and built a small, honest model of a real multi-tenant database: data cut into key-range partitions, every partition its own 3-way Raft group, hot partitions splitting themselves right at the point of maximum pain, every tenant rate-limited at two levels, and routers shuffle-sharded so one unlucky tenant can't drag everyone else down with them.
 
-The interesting part is not that it works on a sunny day. It is that **every run is a reproducible experiment under hostile conditions** — crashed nodes, network partitions, 20% packet loss, duplicated and reordered messages — and that **every single client operation is checked for linearizability afterwards**. If something is wrong, you get a seed that reproduces it bit-for-bit, and an explanation of exactly which read saw the impossible value.
+Working on a sunny day is the easy part. The fun part — the part this project actually cares about — is that **every run is a reproducible experiment under hostile conditions**: crashed nodes, network partitions, 20% packet loss, messages that duplicate and arrive out of order. And then **every single client operation gets checked for linearizability afterwards**, no exceptions. Something breaks? You get a seed that reproduces the failure bit-for-bit, plus a plain-English explanation of exactly which read saw something that should have been impossible.
 
 ```
 $ go run ./cmd/tessera-sim -seeds 100
@@ -14,9 +16,9 @@ seed 2: LINEARIZABLE ✓  (10347 ops over 128 keys checked; wall 188ms)
 0/100 seeds failed  (wall 18.8s)
 ```
 
-Each seed is 10 seconds of virtual time with ~8 injected faults, ~11k client operations, ~280k simulated events — and runs in ~200 ms of wall time.
+Each seed packs 10 seconds of virtual time, ~8 injected faults, ~11k client operations, and ~280k simulated events into roughly 200 ms of real wall time. That's the whole appeal of deterministic simulation: you get to run a very bad day for your database, over and over, in less time than it takes to read this sentence.
 
-Pure Go, standard library only, ~3.6k lines.
+Pure Go, standard library only, ~3.6k lines. No frameworks to fight, nothing to `go get`.
 
 ---
 

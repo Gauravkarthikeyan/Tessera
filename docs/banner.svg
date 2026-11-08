@@ -1,0 +1,64 @@
+<svg viewBox="0 0 1200 320" xmlns="http://www.w3.org/2000/svg" font-family="SFMono-Regular, Consolas, Menlo, monospace">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0e14"/>
+      <stop offset="100%" stop-color="#11161f"/>
+    </linearGradient>
+    <clipPath id="round">
+      <rect x="0" y="0" width="1200" height="320" rx="14"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#round)">
+    <rect width="1200" height="320" fill="url(#bg)"/>
+
+    <!-- tessera tile mosaic, faint, bottom-right -->
+    <g opacity="0.16" stroke="#3fb950" stroke-width="1">
+      <g transform="translate(760,40)">
+        <rect x="0" y="0" width="36" height="36"/>
+        <rect x="40" y="0" width="36" height="36"/>
+        <rect x="80" y="0" width="36" height="36"/>
+        <rect x="120" y="0" width="36" height="36"/>
+        <rect x="0" y="40" width="36" height="36"/>
+        <rect x="40" y="40" width="76" height="36"/>
+        <rect x="120" y="40" width="36" height="36"/>
+        <rect x="0" y="80" width="76" height="36"/>
+        <rect x="80" y="80" width="36" height="76"/>
+        <rect x="120" y="80" width="36" height="36"/>
+        <rect x="0" y="120" width="36" height="36"/>
+        <rect x="40" y="120" width="36" height="36"/>
+        <rect x="120" y="120" width="36" height="36"/>
+        <rect x="0" y="160" width="76" height="36"/>
+        <rect x="120" y="160" width="36" height="36"/>
+        <rect x="160" y="0" width="36" height="76"/>
+        <rect x="200" y="0" width="36" height="36"/>
+        <rect x="160" y="80" width="76" height="36"/>
+        <rect x="200" y="40" width="36" height="36"/>
+        <rect x="160" y="120" width="36" height="76"/>
+        <rect x="200" y="120" width="36" height="36"/>
+        <rect x="200" y="160" width="36" height="36"/>
+      </g>
+    </g>
+
+    <!-- title bar dots -->
+    <circle cx="28" cy="26" r="6" fill="#ff5f56"/>
+    <circle cx="48" cy="26" r="6" fill="#ffbd2e"/>
+    <circle cx="68" cy="26" r="6" fill="#27c93f"/>
+    <text x="90" y="31" font-size="13" fill="#5b6472">tessera-sim — zsh</text>
+    <line x1="0" y1="46" x2="1200" y2="46" stroke="#232a36" stroke-width="1"/>
+
+    <!-- wordmark -->
+    <text x="40" y="128" font-size="56" font-weight="700" fill="#e6edf3">tessera<tspan fill="#3fb950">_</tspan></text>
+    <text x="40" y="160" font-size="17" fill="#8b949e">multi-tenant · partitioned · Raft-replicated KV store</text>
+
+    <!-- terminal transcript, senior-engineer-nerd flavor -->
+    <g font-size="16" fill="#8b949e">
+      <text x="40" y="210"><tspan fill="#58a6ff">$</tspan> go run ./cmd/tessera-sim -seeds 100</text>
+      <text x="40" y="236"><tspan fill="#3fb950">seed 1: LINEARIZABLE ✓</tspan>  (11505 ops · 128 keys · wall 209ms)</text>
+      <text x="40" y="262"><tspan fill="#3fb950">seed 2: LINEARIZABLE ✓</tspan>  (10347 ops · 128 keys · wall 188ms)</text>
+      <text x="40" y="288" fill="#6e7681">...</text>
+    </g>
+
+    <text x="820" y="300" font-size="14" fill="#3fb950" text-anchor="end">0/100 seeds failed · trust, but linearize</text>
+  </g>
+</svg>
