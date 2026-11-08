@@ -1,0 +1,47 @@
+<svg viewBox="0 0 1200 560" xmlns="http://www.w3.org/2000/svg" font-family="SFMono-Regular, Consolas, Menlo, monospace">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0e14"/>
+      <stop offset="100%" stop-color="#11161f"/>
+    </linearGradient>
+    <clipPath id="round2">
+      <rect x="0" y="0" width="1200" height="560" rx="14"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#round2)">
+    <rect width="1200" height="560" fill="url(#bg2)"/>
+
+    <circle cx="28" cy="26" r="6" fill="#ff5f56"/>
+    <circle cx="48" cy="26" r="6" fill="#ffbd2e"/>
+    <circle cx="68" cy="26" r="6" fill="#27c93f"/>
+    <text x="90" y="31" font-size="13" fill="#5b6472">tessera-sim — zsh</text>
+    <line x1="0" y1="46" x2="1200" y2="46" stroke="#232a36" stroke-width="1"/>
+
+    <g font-size="15" fill="#c9d1d9">
+      <text x="32" y="80"><tspan fill="#58a6ff">$</tspan> go run ./cmd/tessera-sim -seeds 1000</text>
+
+      <text x="32" y="108" fill="#6e7681">... 999 clean seeds ...</text>
+
+      <text x="32" y="140" fill="#f85149" font-weight="700">seed 108: NOT LINEARIZABLE ✗  (10502 ops over 128 keys checked)</text>
+
+      <text x="32" y="172" fill="#8b949e">key orders/k0043: NOT linearizable</text>
+      <text x="32" y="196" fill="#8b949e">last linearizable prefix:</text>
+      <text x="52" y="220" fill="#3fb950">✓ c12 orders/k0043 put("c12.79")  → v4   [760.6ms, 767.3ms]</text>
+      <text x="52" y="244" fill="#3fb950">✓ c8  orders/k0043 get               → v4   [808.7ms, 815.2ms]</text>
+
+      <text x="32" y="276" fill="#8b949e">no valid order exists for:</text>
+      <text x="52" y="300" fill="#f85149">✗ c8 orders/k0043 get → "c2.100"@v6  [937.9ms, 1359.3ms]</text>
+      <text x="52" y="324" fill="#f85149">✗ c2 orders/k0043 put("c2.100") → v6  [968.8ms, 982.8ms]</text>
+
+      <text x="32" y="362" font-size="17" fill="#e6edf3" font-weight="700">v4 → v6. v5 never happened. zero faults injected yet.</text>
+
+      <text x="32" y="396" fill="#8b949e">↳ reproduce with: go run ./cmd/tessera-sim -seed 108 -scenario default -v</text>
+
+      <text x="32" y="432" fill="#6e7681">re-ran it twice — identical op count, identical failure, every time.</text>
+      <text x="32" y="456" fill="#6e7681">that's the whole point of building it deterministic: a bug you can't un-reproduce.</text>
+    </g>
+
+    <text x="1168" y="528" font-size="14" fill="#d29922" text-anchor="end">1/1000 seeds failed · still chasing it</text>
+  </g>
+</svg>
