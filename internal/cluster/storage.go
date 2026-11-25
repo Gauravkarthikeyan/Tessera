@@ -34,21 +34,24 @@ type replica struct {
 	r         *raft.Raft
 	pending   map[uint64]pendingReq // log index → waiting request (leader only)
 	wasLead   bool
+	elections uint64 // last seen r.Elections, for cluster-wide counting
 	bucket    *admission.TokenBucket
 	heat      *admission.HeatTracker
 	lastSplit time.Duration
 	splitting bool
 }
 
-type rejectKey struct {
+type reqKey struct {
 	router  sim.NodeID
 	rid     uint64
 	attempt int
 }
 
-type rejection struct {
-	resp StoreResp
-	at   time.Duration
+// decision is what a storage node did with one (router, request, attempt).
+type decision struct {
+	accepted bool      // proposed to Raft; the commit will answer it
+	resp     StoreResp // otherwise: the definite rejection that was sent
+	at       time.Duration
 }
 
 // StorageNode hosts replicas of many partitions (multi-Raft).
@@ -59,11 +62,21 @@ type StorageNode struct {
 	groups map[kv.GroupID]*groupDisk // durable
 	reps   map[kv.GroupID]*replica
 	order  []kv.GroupID // deterministic iteration order
-	// rejected remembers definite rejections so that a duplicated copy of
-	// the same request (the network duplicates packets) gets the same answer
-	// instead of being proposed later — which would turn "definitely not
-	// applied" into a lie.
-	rejected map[rejectKey]rejection
+	// decided remembers what this node did with every recent request, so a
+	// duplicated copy (the network duplicates packets) can never get a
+	// different answer from the original:
+	//
+	//   - a duplicate of a rejected request gets the same rejection, instead
+	//     of being proposed later;
+	//   - a duplicate of an accepted request is dropped, instead of being
+	//     re-evaluated. Re-evaluating it is how a copy that arrives after the
+	//     partition's token bucket ran dry got answered "throttled" while the
+	//     original was already in the log — and that "definitely not applied"
+	//     reached the router before the commit did. (Seed 108.)
+	//
+	// Either way the other outcome would turn "definitely not applied" into
+	// a lie.
+	decided map[reqKey]decision
 }
 
 func (c *Cluster) newStorage(w *sim.World, id sim.NodeID, disk *sim.Disk) sim.Node {
@@ -79,7 +92,7 @@ func (c *Cluster) newStorage(w *sim.World, id sim.NodeID, disk *sim.Disk) sim.No
 			}
 		}
 	}
-	s := &StorageNode{w: w, id: id, c: c, groups: groups, reps: map[kv.GroupID]*replica{}, rejected: map[rejectKey]rejection{}}
+	s := &StorageNode{w: w, id: id, c: c, groups: groups, reps: map[kv.GroupID]*replica{}, decided: map[reqKey]decision{}}
 	ids := make([]kv.GroupID, 0, len(groups))
 	for gid := range groups {
 		ids = append(ids, gid)
@@ -113,6 +126,7 @@ func (s *StorageNode) startReplica(gid kv.GroupID) *replica {
 		HeartbeatTicks:        heartbeatTicks,
 		Rand:                  rand.New(rand.NewSource(s.w.Rand().Int63())),
 		UnsafeCommitPriorTerm: s.c.cfg.Bugs.UnsafeCommit,
+		PreVote:               s.c.cfg.PreVote,
 	}, gd.HS)
 	rep.lastSplit = s.w.Now()
 	s.reps[gid] = rep
@@ -144,9 +158,9 @@ func (s *StorageNode) tick() {
 		s.maybeSplit(rep)
 	}
 	now := s.w.Now()
-	for k, v := range s.rejected {
-		if now-v.at > rejectCacheTTL {
-			delete(s.rejected, k)
+	for k, v := range s.decided {
+		if now-v.at > decisionCacheTTL {
+			delete(s.decided, k)
 		}
 	}
 	s.w.After(s.id, tickInterval, s.tick)
@@ -174,6 +188,14 @@ func (s *StorageNode) flush(rep *replica) {
 	// commit (a new leader may or may not have them). Say so explicitly.
 	if rep.wasLead && !rep.r.IsLeader() {
 		s.failPending(rep, StAmbiguous)
+		s.c.stats.LeaderLosses++
+	}
+	if !rep.wasLead && rep.r.IsLeader() {
+		s.c.stats.LeaderElected++
+	}
+	if n := rep.r.Elections; n > rep.elections {
+		s.c.stats.Elections += int(n - rep.elections)
+		rep.elections = n
 	}
 	rep.wasLead = rep.r.IsLeader()
 }
@@ -236,13 +258,18 @@ func (s *StorageNode) apply(rep *replica, e raft.Entry) {
 
 func (s *StorageNode) reject(router sim.NodeID, m StoreReq, st Status, hint sim.NodeID) {
 	resp := StoreResp{RID: m.RID, Attempt: m.Attempt, Group: m.Group, Status: st, LeaderHint: hint}
-	s.rejected[rejectKey{router, m.RID, m.Attempt}] = rejection{resp: resp, at: s.w.Now()}
+	s.decided[reqKey{router, m.RID, m.Attempt}] = decision{resp: resp, at: s.w.Now()}
 	s.w.Send(s.id, router, resp)
 }
 
 func (s *StorageNode) handleStore(from sim.NodeID, m StoreReq) {
-	if prev, ok := s.rejected[rejectKey{from, m.RID, m.Attempt}]; ok {
-		s.w.Send(s.id, from, prev.resp) // duplicate of a rejected request
+	if prev, ok := s.decided[reqKey{from, m.RID, m.Attempt}]; ok {
+		if !prev.accepted {
+			s.w.Send(s.id, from, prev.resp) // duplicate of a rejected request
+		}
+		// Duplicate of an accepted request: the commit (or a leadership
+		// loss) answers it. If that answer is lost, the router times out
+		// and treats the attempt as maybe-applied, which is the truth.
 		return
 	}
 	rep := s.reps[m.Group]
@@ -276,6 +303,7 @@ func (s *StorageNode) handleStore(from sim.NodeID, m StoreReq) {
 		return
 	}
 	rep.pending[idx] = pendingReq{router: from, rid: m.RID, attempt: m.Attempt, term: term}
+	s.decided[reqKey{from, m.RID, m.Attempt}] = decision{accepted: true, at: now}
 	s.flush(rep)
 }
 

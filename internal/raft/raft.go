@@ -21,10 +21,12 @@
 // Implemented: leader election with randomized timeouts, log replication with
 // fast conflict back-off (term-skipping hints), the "commit only current-term
 // entries" rule (§5.4.2, Figure 8), and CheckQuorum so an isolated leader
-// steps down instead of accepting writes it can never commit.
+// steps down instead of accepting writes it can never commit, and Pre-Vote
+// (§9.6 of Ongaro's thesis) so a node coming back from a partition cannot
+// depose a healthy leader just because its term ran ahead while it was away.
 //
 // Not implemented (deliberately, see README): log compaction/snapshots,
-// membership changes, pre-vote.
+// membership changes.
 package raft
 
 import (
@@ -65,6 +67,8 @@ const (
 	MsgVoteResp
 	MsgApp
 	MsgAppResp
+	MsgPreVote
+	MsgPreVoteResp
 )
 
 func (t MsgType) String() string {
@@ -77,6 +81,10 @@ func (t MsgType) String() string {
 		return "App"
 	case MsgAppResp:
 		return "AppResp"
+	case MsgPreVote:
+		return "PreVote"
+	case MsgPreVoteResp:
+		return "PreVoteResp"
 	}
 	return "?"
 }
@@ -87,9 +95,10 @@ type Message struct {
 	From, To NodeID
 	Term     uint64
 
-	// MsgVote
+	// MsgVote, MsgPreVote. For MsgPreVote, Term is the term the sender
+	// *would* campaign in (its current term + 1); it has not adopted it.
 	LastIndex, LastTerm uint64
-	// MsgVoteResp
+	// MsgVoteResp, MsgPreVoteResp
 	Granted bool
 
 	// MsgApp
@@ -110,9 +119,12 @@ const (
 	Follower Role = iota
 	Candidate
 	Leader
+	PreCandidate
 )
 
-func (r Role) String() string { return [...]string{"follower", "candidate", "leader"}[r] }
+func (r Role) String() string {
+	return [...]string{"follower", "candidate", "leader", "pre-candidate"}[r]
+}
 
 // Config configures a Raft peer.
 type Config struct {
@@ -130,6 +142,15 @@ type Config struct {
 	// the bug illustrated by Figure 8 of the Raft paper; it exists only so
 	// the simulator can demonstrate that it finds it.
 	UnsafeCommitPriorTerm bool
+
+	// PreVote runs a non-binding straw poll before every real election. A
+	// node only increments its term and campaigns once a majority says it
+	// *would* vote for it — and a peer that has heard from a live leader
+	// within the minimum election timeout always says no. Without this, a
+	// node that was partitioned away keeps bumping its term, and the moment
+	// the partition heals its inflated term forces the healthy leader to
+	// step down: an election nobody needed and a burst of unavailability.
+	PreVote bool
 }
 
 // Raft is a single peer in a single consensus group.
@@ -155,7 +176,8 @@ type Raft struct {
 	msgs []Message
 
 	// Observability.
-	Elections uint64
+	Elections uint64 // real elections started (term increments by campaign)
+	PreVotes  uint64 // pre-vote polls started
 }
 
 // New creates a Raft peer over durable state hs (which may be non-empty after
@@ -187,6 +209,7 @@ func (r *Raft) Leader() NodeID    { return r.leader }
 func (r *Raft) Term() uint64      { return r.hs.Term }
 func (r *Raft) Commit() uint64    { return r.commit }
 func (r *Raft) IsLeader() bool    { return r.role == Leader }
+func (r *Raft) VotedFor() NodeID  { return r.hs.VotedFor }
 func (r *Raft) LastIndex() uint64 { return r.hs.Log[len(r.hs.Log)-1].Index }
 func (r *Raft) lastTerm() uint64  { return r.hs.Log[len(r.hs.Log)-1].Term }
 func (r *Raft) termAt(i uint64) uint64 {
@@ -276,14 +299,23 @@ func (r *Raft) Tick() {
 	default:
 		r.electionElapsed++
 		if r.electionElapsed >= r.electionTimeout {
-			r.campaign()
+			if r.cfg.PreVote {
+				r.preCampaign()
+			} else {
+				r.campaign()
+			}
 		}
 	}
 }
 
 // Step processes a message from a peer.
 func (r *Raft) Step(m Message) {
-	if m.Term > r.hs.Term {
+	// Pre-vote traffic carries a *prospective* term. Adopting it would
+	// defeat the point: the whole idea is that asking costs nothing. The one
+	// exception is a rejection from a peer that is genuinely ahead of us,
+	// which tells us our term is stale.
+	preVoteTraffic := m.Type == MsgPreVote || (m.Type == MsgPreVoteResp && m.Granted)
+	if m.Term > r.hs.Term && !preVoteTraffic {
 		lead := None
 		if m.Type == MsgApp {
 			lead = m.From
@@ -302,6 +334,10 @@ func (r *Raft) Step(m Message) {
 		r.handleAppend(m)
 	case MsgAppResp:
 		r.handleAppendResp(m)
+	case MsgPreVote:
+		r.handlePreVote(m)
+	case MsgPreVoteResp:
+		r.handlePreVoteResp(m)
 	}
 }
 
@@ -337,6 +373,29 @@ func (r *Raft) campaign() {
 	for _, p := range r.cfg.Peers {
 		if p != r.cfg.ID {
 			r.send(Message{Type: MsgVote, To: p, LastIndex: r.LastIndex(), LastTerm: r.lastTerm()})
+		}
+	}
+}
+
+// preCampaign starts a pre-vote poll for term+1 without touching durable
+// state. Nothing is persisted, so a node that polls forever from inside a
+// partition rejoins with exactly the term it left with.
+func (r *Raft) preCampaign() {
+	r.role = PreCandidate
+	r.leader = None
+	r.votes = map[NodeID]bool{r.cfg.ID: true}
+	r.PreVotes++
+	r.resetElectionTimer()
+	if len(r.votes) >= r.quorum() {
+		r.campaign()
+		return
+	}
+	for _, p := range r.cfg.Peers {
+		if p != r.cfg.ID {
+			r.msgs = append(r.msgs, Message{
+				Type: MsgPreVote, From: r.cfg.ID, To: p, Term: r.hs.Term + 1,
+				LastIndex: r.LastIndex(), LastTerm: r.lastTerm(),
+			})
 		}
 	}
 }
@@ -377,6 +436,33 @@ func (r *Raft) handleVote(m Message) {
 		r.resetElectionTimer()
 	}
 	r.send(Message{Type: MsgVoteResp, To: m.From, Granted: grant})
+}
+
+// handlePreVote answers "would you vote for me in term m.Term?" without
+// changing any state — no term bump, no recorded vote, no timer reset.
+func (r *Raft) handlePreVote(m Message) {
+	upToDate := m.LastTerm > r.lastTerm() ||
+		(m.LastTerm == r.lastTerm() && m.LastIndex >= r.LastIndex())
+	// Leader stickiness: if we have a leader and heard from it within the
+	// minimum election timeout, there is no reason to replace it.
+	leaderAlive := r.role == Leader ||
+		(r.leader != None && r.electionElapsed < r.cfg.ElectionTicks)
+	grant := m.Term > r.hs.Term && upToDate && !leaderAlive
+	resp := Message{Type: MsgPreVoteResp, From: r.cfg.ID, To: m.From, Granted: grant, Term: r.hs.Term}
+	if grant {
+		resp.Term = m.Term // echo the prospective term so the poller can match it
+	}
+	r.msgs = append(r.msgs, resp)
+}
+
+func (r *Raft) handlePreVoteResp(m Message) {
+	if r.role != PreCandidate || m.Term != r.hs.Term+1 || !m.Granted {
+		return
+	}
+	r.votes[m.From] = true
+	if len(r.votes) >= r.quorum() {
+		r.campaign()
+	}
 }
 
 func (r *Raft) handleVoteResp(m Message) {

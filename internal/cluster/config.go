@@ -62,6 +62,10 @@ type Config struct {
 	FaultInterval float64 // mean seconds between faults
 	PoisonTenant  bool    // add a tenant that sends router-killing requests
 
+	// PreVote enables Raft's pre-vote phase on every partition group, so a
+	// replica returning from a partition cannot depose a healthy leader.
+	PreVote bool
+
 	Bugs  Bugs
 	Trace func(format string, args ...any)
 }
@@ -81,6 +85,7 @@ func DefaultConfig(seed int64) Config {
 		MaxPartitions:  8,
 		Faults:         true,
 		FaultInterval:  1.0,
+		PreVote:        true,
 		Tables: []TableConfig{
 			{Name: "orders", ProvisionedRate: 3000, InitialPartitions: 1, Clients: 12, Keys: 64, Zipf: 0, ReadFraction: 0.5, CASFraction: 0.15, DeleteFraction: 0.05, ThinkTime: 2 * time.Millisecond},
 			{Name: "carts", ProvisionedRate: 800, InitialPartitions: 2, Clients: 6, Keys: 32, Zipf: 1.1, ReadFraction: 0.6, CASFraction: 0.2, DeleteFraction: 0.05, ThinkTime: 5 * time.Millisecond},
@@ -112,5 +117,5 @@ const (
 	tokenLease       = 25.0
 	splitCooldown    = 1500 * time.Millisecond
 	heatWindow       = 500 * time.Millisecond
-	rejectCacheTTL   = 1 * time.Second
+	decisionCacheTTL = 1 * time.Second
 )

@@ -37,6 +37,7 @@ func main() {
 	trace := flag.Bool("trace", false, "print an event trace (single seed only)")
 	verbose := flag.Bool("v", false, "verbose report for every seed")
 	stopOnFail := flag.Bool("stop", true, "stop the sweep at the first failure")
+	preVote := flag.Bool("prevote", true, "enable Raft pre-vote (disable to watch rejoining nodes depose leaders)")
 	flag.Parse()
 
 	if *bug != "" {
@@ -53,6 +54,7 @@ func main() {
 		cfg := build(*scenario, s)
 		cfg.Duration = *dur
 		cfg.Faults = cfg.Faults && *faults
+		cfg.PreVote = *preVote
 		applyBug(&cfg, *bug)
 		if *trace && *seeds == 1 {
 			cfg.Trace = func(f string, a ...any) { fmt.Printf(f+"\n", a...) }

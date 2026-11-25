@@ -63,6 +63,13 @@ func (c *Cluster) newRouter(w *sim.World, id sim.NodeID, _ *sim.Disk) sim.Node {
 		pending:    map[uint64]*rreq{},
 		byClient:   map[clientKey]*rreq{},
 		done:       map[clientKey]ClientResp{},
+		// Request ids must never repeat across restarts: storage nodes cache
+		// their decision per (router, rid, attempt), so a restarted router
+		// that reused ids would have fresh requests answered with a previous
+		// incarnation's rejection, or silently dropped as "duplicates".
+		// Starting at the (virtual) boot time in nanoseconds keeps them
+		// monotonic.
+		rid: uint64(w.Now()),
 	}
 	r.askMap()
 	w.After(id, mapRefresh, r.refreshLoop)

@@ -10,15 +10,15 @@ Working on a sunny day is the easy part. The fun part — the part this project 
 
 ```
 $ go run ./cmd/tessera-sim -seeds 100
-seed 1: LINEARIZABLE ✓  (11505 ops over 128 keys checked; wall 209ms)
-seed 2: LINEARIZABLE ✓  (10347 ops over 128 keys checked; wall 188ms)
+seed 1: LINEARIZABLE ✓  (13143 ops over 128 keys checked; wall 382ms)
+seed 2: LINEARIZABLE ✓  (12113 ops over 128 keys checked; wall 295ms)
 ...
-0/100 seeds failed  (wall 18.8s)
+0/100 seeds failed  (wall 33.0s)
 ```
 
-Each seed packs 10 seconds of virtual time, ~8 injected faults, ~11k client operations, and ~280k simulated events into roughly 200 ms of real wall time. That's the whole appeal of deterministic simulation: you get to run a very bad day for your database, over and over, in less time than it takes to read this sentence.
+Each seed packs 10 seconds of virtual time, ~8 injected faults, ~12k client operations, and ~320k simulated events into roughly 300 ms of real wall time. That's the whole appeal of deterministic simulation: you get to run a very bad day for your database, over and over, in less time than it takes to read this sentence.
 
-Pure Go, standard library only, ~3.6k lines. No frameworks to fight, nothing to `go get`.
+Pure Go, standard library only, ~4k lines. No frameworks to fight, nothing to `go get`.
 
 ---
 
@@ -36,9 +36,11 @@ Pure Go, standard library only, ~3.6k lines. No frameworks to fight, nothing to 
   - [Two-level admission control](#6-two-level-admission-control)
   - [Shuffle-sharded routers](#7-shuffle-sharded-routers)
   - [Being honest about ambiguity](#8-being-honest-about-ambiguity)
+  - [Pre-Vote: don't let a returning node depose a healthy leader](#9-pre-vote-dont-let-a-returning-node-depose-a-healthy-leader)
 - [Deterministic simulation](#deterministic-simulation)
 - [The linearizability checker](#the-linearizability-checker)
 - [Proving the checker has teeth](#proving-the-checker-has-teeth)
+- [A real bug it found: seed 108](#a-real-bug-it-found-seed-108)
 - [Scenarios](#scenarios)
 - [Running it](#running-it)
 - [Repository layout](#repository-layout)
@@ -159,7 +161,7 @@ That makes the algorithm trivially drivable by a simulator, and makes "what does
 
 Durable state (`term`, `votedFor`, `log`) lives in a `*HardState` owned by the host's disk. Raft mutates it **before** emitting any message that depends on it, which is precisely the "persist before you reply" rule real implementations must fsync for. On restart, volatile state (role, commit index, applied index) starts from zero, exactly as in a real process.
 
-Implemented: randomized elections, log replication with **fast conflict back-off** (skip a whole conflicting term per round trip), the **§5.4.2 rule** (only current-term entries are committed by counting replicas — older entries commit indirectly via a leader no-op), and **CheckQuorum** (a leader that can't hear a majority for an election timeout steps down instead of accepting proposals it can never commit).
+Implemented: randomized elections, log replication with **fast conflict back-off** (skip a whole conflicting term per round trip), the **§5.4.2 rule** (only current-term entries are committed by counting replicas — older entries commit indirectly via a leader no-op), **CheckQuorum** (a leader that can't hear a majority for an election timeout steps down instead of accepting proposals it can never commit), and **Pre-Vote** (see [§9](#9-pre-vote-dont-let-a-returning-node-depose-a-healthy-leader)).
 
 ### 2. Multi-Raft: one consensus group per partition
 
@@ -226,9 +228,37 @@ Every outcome a router sends back is one of:
 - **Definitely not applied.** Throttled before forwarding, not the leader, wrong range, no such group.
 - **Maybe applied.** A timeout, or a leader that lost leadership with the proposal in flight.
 
-The tricky case is **duplicated packets**. Suppose a request reaches a follower, gets `NotLeader`, and a duplicate copy of the same packet arrives 2 ms later — after that node has become leader. A naive node would propose it, and the "definitely not applied" answer would be a lie. Tessera's storage nodes remember recent rejections per `(router, request, attempt)` and answer duplicates identically. Routers do the same per `(client, seq, attempt)`.
+The tricky case is **duplicated packets**, and it cuts both ways:
+
+- A request reaches a follower and gets `NotLeader`. A duplicate copy arrives 2 ms later, after that node has become leader. A naive node would propose it, and the "definitely not applied" answer would be a lie.
+- A request reaches the leader, passes the partition's token bucket and is proposed. A duplicate arrives a moment later, finds the bucket empty, and gets `Throttled`. That rejection beats the commit back to the router, and "definitely not applied" is a lie the other way round. (This one was real. See [seed 108](#a-real-bug-it-found-seed-108).)
+
+So storage nodes remember what they decided for every recent `(router, request, attempt)`: duplicates of a rejection get the same rejection, and duplicates of an accepted request are dropped, because the commit will answer them. Routers do the same per `(client, seq, attempt)`, and router request ids keep increasing across restarts, so a restarted router can't collide with its earlier self.
 
 Clients turn all of this into history records: OK → a completed operation; definitely-not-applied → nothing; maybe-applied → an **indeterminate** operation that the checker may place anywhere after its call, or nowhere at all.
+
+### 9. Pre-Vote: don't let a returning node depose a healthy leader
+
+Plain Raft has an availability problem. A node cut off from its group keeps timing out and starting elections it can't win, and each one bumps its term. When the partition heals, its first message carries a term far ahead of everyone else's, and Raft's "higher term wins" rule makes the healthy leader step down. The group then holds an election it didn't need, and every request in flight on the old leader comes back as *maybe applied*.
+
+Pre-Vote (§9.6 of Ongaro's thesis) puts a straw poll in front of every election:
+
+1. On election timeout, a node becomes a **pre-candidate**. It sends `PreVote(term+1, lastIndex, lastTerm)` without touching its own term or vote. Nothing is persisted.
+2. A peer says yes only if the candidate's log is up to date **and** the peer hasn't heard from a live leader within the minimum election timeout (leader stickiness). It doesn't adopt the prospective term or record a vote.
+3. The node runs a real election only once a majority says yes.
+
+A node that's stuck in a partition can poll forever and still come back with the term it left with. Pre-Vote is on by default. `-prevote=false` turns it off so you can compare.
+
+On the same 50 seeds of the default chaos scenario:
+
+| | Pre-Vote off | Pre-Vote on | change |
+|---|---:|---:|---:|
+| elections started | 5,018 | 1,060 | **−79%** |
+| leaders deposed while still alive | 860 | 298 | **−65%** |
+| client ops left *maybe applied* | 348 | 85 | **−76%** |
+| client ops that succeeded | 569,094 | 601,472 | +5.7% |
+
+All 1,000 seeds stay linearizable either way. Pre-Vote is about availability, not safety, and the Raft chaos tests run both modes to check that it doesn't cost safety either.
 
 ---
 
@@ -263,7 +293,7 @@ Each of these is a real class of bug that has shipped in real systems. Enable on
 
 | `-bug` | What it breaks | Caught |
 |---|---|---|
-| `local-reads` | Leaders answer reads from local state without confirming they're still leader. A deposed leader in a minority partition serves stale data. | seed 4 |
+| `local-reads` | Leaders answer reads from local state without confirming they're still leader. A deposed leader in a minority partition serves stale data. | seed 18 |
 | `no-dedup` | The state machine ignores the session table, so duplicated or retried requests apply twice. | seed 1 |
 | `no-range-check` | No in-log range check: writes committed after a split land in a partition that no longer owns the key and are lost. | seed 1 |
 | `split-drop-sessions` | Split children don't inherit the session table, so a retry after a split re-executes. | seed 1 |
@@ -273,23 +303,48 @@ Each of these is a real class of bug that has shipped in real systems. Enable on
 Here is what `local-reads` looks like:
 
 ```
-$ go run ./cmd/tessera-sim -bug local-reads -seed 4
+$ go run ./cmd/tessera-sim -bug local-reads -seed 18
 
-seed 4: NOT LINEARIZABLE ✗  (11429 ops over 128 keys checked)
+seed 18: NOT LINEARIZABLE ✗  (12370 ops over 128 keys checked)
   faults injected:
-      1457.9ms  partition storage {n4,n3} from the other storage nodes for 1.478s
+      5836.7ms  partition storage {n2,n3} from the other storage nodes for 981ms
       ...
-  key carts/k0002: NOT linearizable (231 ops)
+  key orders/k0019: NOT linearizable (78 ops)
     last linearizable prefix:
-      ✓ c18 carts/k0002 put("c18.393") → v3  [9154.988ms, 9161.589ms]
-      ✓ c18 carts/k0002 put("c18.401") → v4  [9228.540ms, 9440.967ms]
+      ✓ c3 orders/k0019 get → "c9.306"@v8  [5185.774ms, 5187.760ms]
+      ✓ c5 orders/k0019 put("c5.341") → v9  [6007.286ms, 6054.713ms]
     no valid order exists for:
-      ✗ c15 carts/k0002 get → "c18.393"@v3  [9448.044ms, 9453.491ms]
+      ✗ c6 orders/k0019 get → "c9.306"@v8  [6103.112ms, 6109.098ms]
 ```
 
-The write of v4 *completed* at 9440.97 ms. A read that *started* 7 ms later returned v3. No sequential order allows that: it's a stale read from a leader that had already been replaced.
+The write of v9 *completed* at 6054.71 ms. A read that *started* 48 ms later returned v8. No sequential order allows that: it's a stale read from a leader stuck on the minority side of the partition, which had already been replaced.
+
+(This bug used to show up at seed 4. With Pre-Vote on, leaders get deposed less often, so there are fewer stale-leader windows for it to hit and the sweep takes a few more seeds. `-prevote=false -bug local-reads` finds it sooner.)
 
 **About `unsafe-commit`.** The Figure 8 anomaly needs a very specific sequence: a leader replicates an old-term entry to a majority, crashes, and a competing leader with a different entry at that index wins the next election before the first one returns. Uniform random faults rarely produce it. It's kept as an open target for a fault schedule that's biased towards leader crashes right after replication.
+
+---
+
+## A real bug it found: seed 108
+
+<img src="docs/finding-seed108.svg" alt="seed 108: v4 → v6, v5 never happened" width="100%" />
+
+The injected bugs show the checker *can* catch things. Seed 108 is the checker catching a real bug in Tessera.
+
+Out of 1,000 clean seeds, seed 108 failed. A key jumped from v4 to v6, and no operation in the history ever wrote v5. That happened at 900 ms, before any fault had been injected, so the only hostility in play was the background 1% packet loss and 0.5% duplication.
+
+Because the run is deterministic, the failure replayed identically every time. That made it possible to add a print and see who wrote v5. It was `c1 put("c1.73")`. The put was committed on all three replicas at 854.7 ms, and 75 ms later its client gave up and recorded it as *definitely never applied*:
+
+```
+853.2ms  router → leader   StoreReq rid=613 (c1 seq 73)
+         network            …delivers it twice
+         leader             copy 1: token OK → proposed to Raft
+         leader             copy 2: bucket now empty → Throttled  ← definite rejection
+854.7ms  all replicas       apply c1.73 → v5
+854.9ms  router             gets Throttled first → "not applied" → client retries … gives up
+```
+
+The storage node already remembered its *rejections* so a duplicate couldn't be proposed after one. It didn't remember its *acceptances*, so a duplicate of an accepted request was evaluated from scratch against a token bucket that had changed in the meantime. The fix is for the node to remember both and drop duplicates of accepted requests ([§8](#8-being-honest-about-ambiguity)). The same sweep turned up seeds 112 and 130 with the same root cause. All three are pinned in `internal/cluster/cluster_test.go`, and the test fails if the fix is reverted.
 
 ---
 
@@ -299,15 +354,16 @@ The write of v4 *completed* at 9440.97 ms. A read that *started* 7 ms later retu
 
 ```
 $ go run ./cmd/tessera-sim -seed 1
-seed 1: LINEARIZABLE ✓  (11505 ops over 128 keys checked; wall 209ms)
+seed 1: LINEARIZABLE ✓  (13143 ops over 128 keys checked; wall 378ms)
 
   tenant           ok  throttled   failed  unknown       p50       p99
-  carts          2454          0        0        2    6.24ms  411.49ms
-  orders         5844         79        6        7    6.12ms  409.63ms
-  sessions       3198         54        0        0    7.34ms  409.52ms
+  carts          2953          0        0        0    6.25ms  409.74ms
+  orders         6938        239        3        2    6.18ms  409.34ms
+  sessions       3250         36        1        0    7.17ms  409.75ms
 
-  network: 224433 sent, 217015 delivered, 5298 dropped, 1096 duplicated, 3205 cut by partitions
-  events: 283067   crashes: 4   restarts: 4
+  network: 261459 sent, 253089 delivered, 6102 dropped, 1284 duplicated, 3539 cut by partitions
+  raft: 26 elections, 26 leaders elected, 8 leaders deposed while alive
+  events: 326559   crashes: 4   restarts: 4
 ```
 
 The p99 of ~410 ms is the client's 400 ms attempt timeout firing when a router or leader died mid-request, followed by a successful retry. That's exactly the latency cliff failover costs, and the main thing to improve next (hedged requests, faster leader-loss detection).
@@ -318,20 +374,20 @@ One tenant, one starting partition, 48 clients on a Zipf-skewed key space, at ~4
 
 ```
 $ go run ./cmd/tessera-sim -scenario hot-partition -seed 7
-  splits: 12 (refused: 4)   partition throttles: 4172
+  splits: 11 (refused: 3)   partition throttles: 5255
 
   final partition map:
-    hot/hot-0["","k0001")@g3
-    hot/hot-0.2["k0001","k0002")@g3
-    hot/hot-0.2.2["k0002","k0003")@g1
-    hot/hot-0.2.1["k0003","k0005")@g2
-    hot/hot-0.2.1.1["k0005","k0008")@g1
-    hot/hot-0.1["k0008","k0011")@g4
+    hot/hot-0["","k0001")@g4
+    hot/hot-0.3["k0001","k0002")@g1
+    hot/hot-0.2["k0002","k0004")@g2
+    hot/hot-0.2.1["k0004","k0008")@g1
+    hot/hot-0.1["k0008","k0012")@g4
     ...
-    hot/hot-0.1.1.1.1["k0157","∞")@g1
+    hot/hot-0.1.1.1["k0108","k0173")@g2
+    hot/hot-0.1.1.1.1["k0173","∞")@g1
 ```
 
-Look at the shape: the hot end of the key space (`k0000`–`k0010`) is cut into partitions holding one or two keys each, while the cold tail `k0157`–`∞` stays as one partition. That's what splitting at the load median gives you, as opposed to splitting at the data median. The four refused splits are the partition holding only `k0000`, the hottest key, where splitting can't help.
+Look at the shape: the hot end of the key space (`k0000`–`k0008`) is cut into partitions holding one, two or four keys each, while the cold tail `k0173`–`∞` stays as one partition. That's what splitting at the load median gives you, as opposed to splitting at the data median. The three refused splits are the partition holding only `k0000`, the hottest key, where splitting can't help.
 
 ### Poison tenant: shuffle sharding
 
@@ -340,10 +396,10 @@ Eight tenants and eight routers with shards of 2, plus a tenant whose requests c
 ```
 $ go run ./cmd/tessera-sim -scenario poison -seed 3
   tenant           ok  throttled   failed  unknown
-  tenant00       1483          0        0        0
-  tenant01       1910          0        0        0
+  tenant00       1203          0        0        0
+  tenant01       1920          0        0        0
   ...
-  tenant07       1801          0        0        0
+  tenant07       1786          0        0        0
 
   poison crashes: 24
 ```
@@ -380,7 +436,7 @@ go run ./cmd/tessera-sim -bug local-reads -seeds 50
 go run ./cmd/tessera-sim -scenario hot-partition -v
 ```
 
-Flags: `-seed`, `-seeds`, `-duration` (virtual), `-faults=false`, `-bug <name>`, `-scenario default|calm|hot-partition|poison`, `-trace`, `-v`, `-stop=false` (keep sweeping after a failure).
+Flags: `-seed`, `-seeds`, `-duration` (virtual), `-faults=false`, `-bug <name>`, `-scenario default|calm|hot-partition|poison`, `-prevote=false`, `-trace`, `-v`, `-stop=false` (keep sweeping after a failure).
 
 When a sweep fails, it prints the exact command to reproduce the failing seed.
 
@@ -409,7 +465,6 @@ Scope was chosen so that every included piece is correct, rather than every piec
 
 - **Log compaction / snapshots.** Logs grow without bound and restarts replay from index 1. The split machinery already has a snapshot type, so compaction would mean persisting a snapshot plus a log suffix.
 - **Membership changes and rebalancing.** Children stay on their parent's replicas. Moving replicas needs joint consensus or single-server changes.
-- **Pre-vote.** A partitioned node inflates its term and disrupts the group when it rejoins. That costs availability, not safety.
 - **Read leases / ReadIndex.** All reads go through the log. That's correct but slower; `local-reads` shows what happens if you shortcut it naively.
 - **Replicated control plane.** Metadata and GAC are single processes that never crash in the simulation. The protocol already tolerates lost, duplicated and stale reports, so making them Raft groups is mechanical.
 - **Real network and disk.** Everything runs in the simulator. Swapping `sim.World` for TCP and fsync is an interface boundary, not a redesign.

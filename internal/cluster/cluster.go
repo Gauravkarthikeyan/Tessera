@@ -28,7 +28,14 @@ type Stats struct {
 	PartitionThrottles int
 	TableThrottles     int
 	PoisonCrashes      int
-	Faults             []string
+	// Raft churn, summed over every partition group. Elections counts real
+	// campaigns (term increments); LeaderLosses counts leaders that stepped
+	// down while still alive — every one of those fails its in-flight
+	// requests as "maybe applied".
+	Elections     int
+	LeaderElected int
+	LeaderLosses  int
+	Faults        []string
 }
 
 func (s *Stats) tenant(name string) *TenantStats {
@@ -306,6 +313,8 @@ func (r Report) Summary(verbose bool) string {
 		r.Stats.Splits, r.Stats.SplitsRefused, r.Stats.PartitionThrottles, r.Stats.TableThrottles, r.Stats.PoisonCrashes)
 	fmt.Fprintf(&b, "  network: %d sent, %d delivered, %d dropped, %d duplicated, %d cut by partitions\n",
 		r.Net.Sent, r.Net.Delivered, r.Net.Dropped, r.Net.Duplicated, r.Net.Partitioned)
+	fmt.Fprintf(&b, "  raft: %d elections, %d leaders elected, %d leaders deposed while alive\n",
+		r.Stats.Elections, r.Stats.LeaderElected, r.Stats.LeaderLosses)
 	fmt.Fprintf(&b, "  events: %d   crashes: %d   restarts: %d\n", r.Net.Events, r.Net.Crashes, r.Net.Restarts)
 	tables := make([]string, 0, len(r.Ranges))
 	for t := range r.Ranges {
